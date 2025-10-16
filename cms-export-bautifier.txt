@@ -1,0 +1,147 @@
+Option Explicit
+
+' Set to -240 for EDT, -300 for EST if your epoch is UTC
+Const TZ_OFFSET_MINUTES As Long = 0
+
+Public Sub FixCMS_NumericExport()
+    Dim ws As Worksheet: Set ws = ActiveSheet
+    Dim lr As Long, lc As Long, r As Long
+    Dim tzAdj As Double: tzAdj = TZ_OFFSET_MINUTES / 1440#
+    
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+
+    ' 0) Remove leading "data" row if present (CMS numeric export)
+    If LCase$(Trim$(ws.Cells(1, 1).Value)) = "data" Then ws.Rows(1).Delete
+
+    ' 1) Find last row/col
+    lr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    lc = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+
+    ' 2) If no headers, inject headers in the **numeric export** order
+    Dim hasHeaders As Boolean
+    hasHeaders = LCase$(Trim$(ws.Cells(1, 1).Value)) = "call id"
+    If Not hasHeaders Then
+        ws.Rows(1).Insert
+        Dim h As Variant
+        h = Array( _
+            "Call ID", "Segment", "Date", "Start Time", "Calling Party", "Dialed Number", _
+            "Disposition Code", "Disposition (sec)", "Split/Skill", "Ans Logid", _
+            "Talk (sec)", "Hold (sec)", "ACW (sec)", "Trans Out", "Conf", "Assist", _
+            "Last Call Work Code" _
+        )
+        Dim i As Long
+        For i = 0 To UBound(h): ws.Cells(1, i + 1).Value = h(i): Next i
+        ws.Rows(1).Font.Bold = True
+        lr = lr + 1
+    End If
+
+    ' Column indices for the numeric layout
+    Const COL_ID = 1
+    Const COL_SEG = 2
+    Const COL_DATE = 3              ' Excel serial day (e.g., 45930)
+    Const COL_START = 4             ' UNIX epoch seconds
+    Const COL_ANI = 5
+    Const COL_DNIS = 6
+    Const COL_DISP_CODE = 7         ' 2=ANS, etc. (optional)
+    Const COL_DISP_SEC = 8
+    Const COL_SPLIT = 9
+    Const COL_LOGID = 10
+    Const COL_TALK = 11
+    Const COL_HOLD = 12
+    Const COL_ACW = 13
+    Const COL_TRANS = 14
+    Const COL_CONF = 15
+    Const COL_ASSIST = 16
+    Const COL_WC = 17               ' may be blank in some exports
+
+    ' 3) Convert / format rows
+    Dim epoch As Double, dt As Double
+    For r = 2 To lr
+        ' Date: already Excel serial – just ensure numeric and format later
+        ' Start Time: convert UNIX epoch ? Excel date-time
+        If IsNumeric(ws.Cells(r, COL_START).Value) And Val(ws.Cells(r, COL_START).Value) > 0 Then
+            epoch = Val(ws.Cells(r, COL_START).Value)
+            dt = (epoch / 86400#) + DateSerial(1970, 1, 1) + tzAdj
+            ws.Cells(r, COL_START).Value = dt
+            ' Also ensure the Date column matches the date part of Start Time
+            If IsNumeric(ws.Cells(r, COL_DATE).Value) Then
+                ws.Cells(r, COL_DATE).Value = Int(dt)
+            End If
+        End If
+
+        ' Durations (seconds ? time)
+        SecToTime ws.Cells(r, COL_DISP_SEC)
+        SecToTime ws.Cells(r, COL_TALK)
+        SecToTime ws.Cells(r, COL_HOLD)
+        SecToTime ws.Cells(r, COL_ACW)
+
+        ' Flags 0/1 ? Y/N
+        ZeroOneToYN ws.Cells(r, COL_TRANS)
+        ZeroOneToYN ws.Cells(r, COL_CONF)
+        ZeroOneToYN ws.Cells(r, COL_ASSIST)
+
+        ' Keep ANI / DNIS as text
+        ForceText ws.Cells(r, COL_ANI)
+        ForceText ws.Cells(r, COL_DNIS)
+    Next r
+
+    ' 4) Number formats
+    ws.Range(ws.Cells(2, COL_DATE), ws.Cells(lr, COL_DATE)).NumberFormat = "yyyy-mm-dd"
+    ws.Range(ws.Cells(2, COL_START), ws.Cells(lr, COL_START)).NumberFormat = "m/d/yyyy h:mm:ss AM/PM"
+    ws.Range(ws.Cells(2, COL_DISP_SEC), ws.Cells(lr, COL_DISP_SEC)).NumberFormat = "[h]:mm:ss"
+    ws.Range(ws.Cells(2, COL_TALK), ws.Cells(lr, COL_TALK)).NumberFormat = "[h]:mm:ss"
+    ws.Range(ws.Cells(2, COL_HOLD), ws.Cells(lr, COL_HOLD)).NumberFormat = "[h]:mm:ss"
+    ws.Range(ws.Cells(2, COL_ACW), ws.Cells(lr, COL_ACW)).NumberFormat = "[h]:mm:ss"
+    ws.Range(ws.Cells(2, COL_SPLIT), ws.Cells(lr, COL_SPLIT)).NumberFormat = "0"
+    ws.Range(ws.Cells(2, COL_LOGID), ws.Cells(lr, COL_LOGID)).NumberFormat = "0"
+
+    ' 5) Tidy
+    ws.Columns.AutoFit
+    On Error Resume Next
+    ws.ListObjects.Add(xlSrcRange, ws.Range("A1").CurrentRegion, , xlYes).Name = "CMS_Export"
+    On Error GoTo 0
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+End Sub
+
+' ---- Helpers ----
+Private Sub SecToTime(ByVal c As Range)
+    If IsNumeric(c.Value) Then
+        If Val(c.Value) <> 0 Then c.Value = Val(c.Value) / 86400#
+    Else
+        ' If the field came in as "m:ss" or "h:mm:ss", parse it
+        Dim s As String: s = Trim$(CStr(c.Value))
+        If InStr(s, ":") > 0 Then
+            Dim p() As String, h As Long, m As Long, sec As Double
+            p = Split(s, ":")
+            If UBound(p) = 2 Then
+                h = Val(p(0)): m = Val(p(1)): sec = Val(p(2))
+            ElseIf UBound(p) = 1 Then
+                h = 0: m = Val(p(0)): sec = Val(p(1))
+            Else
+                h = 0: m = 0: sec = Val(p(0))
+            End If
+            c.Value = (h * 3600# + m * 60# + sec) / 86400#
+        End If
+    End If
+End Sub
+
+Private Sub ZeroOneToYN(ByVal c As Range)
+    If IsNumeric(c.Value) Then
+        c.Value = IIf(Val(c.Value) <> 0, "Y", "N")
+    Else
+        Dim s$: s = UCase$(Trim$(c.Value & ""))
+        If s <> "Y" And s <> "N" Then c.Value = "N"
+    End If
+End Sub
+
+Private Sub ForceText(ByVal cell As Range)
+    If Not IsEmpty(cell.Value) Then
+        cell.NumberFormat = "@"
+        cell.Value = CStr(cell.Value)
+    End If
+End Sub
+
+
